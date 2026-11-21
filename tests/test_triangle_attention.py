@@ -8,6 +8,7 @@
 # ruff: noqa: E402
 
 import functools
+import math
 
 import pytest
 import torch
@@ -18,7 +19,7 @@ from geometric_nn_ops_torch.triangle import triangle_attention
 from geometric_nn_ops_torch.triangle._kernels.triangle_attention import (
     triangle_attention_triton,
 )
-from geometric_nn_ops_torch.triangle._masking import mask_val
+from geometric_nn_ops_torch.triangle._masking import masked_key_bias
 from geometric_nn_ops_torch.triangle._reference.triangle_attention import (
     triangle_attention_torch,
 )
@@ -189,11 +190,9 @@ def test_masked_keys_are_ignored(request, impl, dtype):
 @IMPLEMENTATION_PARAM
 @DTYPES_PARAM
 def test_masked_logits_are_suppressed(impl, dtype):
-    """``k`` and the bias at masked keys move those logits, and the sentinel has
-    to bury them whatever they are.
-
-    Bounded by ``test_mask_val_suppresses_any_realistic_logit``: fp16 allows
-    16324, and ``k += n`` moves a logit by roughly ``3n``.
+    """``k`` and the bias at masked keys move those logits, but masked logits
+    are replaced with a constant, so whatever they were cannot reach the
+    output.
     """
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
     tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", dtype, seed=3)
@@ -218,6 +217,61 @@ def test_masked_logits_are_suppressed(impl, dtype):
 
 @requires_gpu
 @IMPLEMENTATION_PARAM
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("kept_logit", [-2e30, -1e38, -3e38], ids=str)
+@pytest.mark.parametrize("use_exp2", [False, True], ids=["exp", "exp2"])
+def test_masked_keys_lose_to_a_very_negative_kept_logit(
+    request, impl, dtype, kept_logit, use_exp2
+):
+    """Masked keys get zero weight however low the one kept logit is and however
+    high the masked ones are (``+2e9`` and ``+1e30`` via the bias): the output
+    is exactly the kept key's ``v``, and masked keys get no ``dk``, ``dv`` or
+    ``dbias``.
+
+    The bound is the kept logit staying above ``finfo(float32).min``, the value
+    masked logits are replaced with. With ``use_exp2`` the kernel scales logits
+    by ``log2(e)`` first, so the bound is ``finfo(float32).min / log2(e)``
+    (about ``-2.36e38``): below it the kept logit overflows to ``-inf`` and the
+    masked keys win.
+    """
+    if use_exp2:
+        if impl is triangle_attention_torch:
+            pytest.skip("the reference has no base-2 path")
+        impl = functools.partial(impl, use_exp2=True)
+        if kept_logit < torch.finfo(torch.float32).min / math.log2(math.e):
+            request.node.add_marker(
+                pytest.mark.xfail(
+                    strict=True,
+                    reason="kept logit * log2(e) overflows fp32 to -inf",
+                )
+            )
+    B, N_seq, N_res, H, D = 1, 1, 32, 4, 32
+    kept = 7
+    tensors = make_inputs(B, N_seq, N_res, H, D, "cuda", dtype, seed=3)
+    mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
+    mask[..., kept] = True
+    bias = torch.empty(B, 1, H, N_res, N_res, device="cuda", dtype=torch.float32)
+    bias[..., 0::2] = 2e9
+    bias[..., 1::2] = 1e30
+    bias[..., kept] = kept_logit
+    tensors["bias"] = bias.to(dtype)
+    leaves = {k: t.detach().clone().requires_grad_(True) for k, t in tensors.items()}
+
+    out = impl(**leaves, mask=mask, scale=D**-0.5)
+    out.backward(torch.ones_like(out))
+
+    expected = tensors["v"][:, :, kept : kept + 1].expand_as(out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    for name, leaf in leaves.items():
+        assert torch.isfinite(leaf.grad).all(), f"non-finite grad_{name}"
+    masked = ~mask.reshape(N_res)
+    assert (leaves["k"].grad[:, :, masked] == 0).all(), "masked key got dk"
+    assert (leaves["v"].grad[:, :, masked] == 0).all(), "masked key got dv"
+    assert (leaves["bias"].grad[..., masked] == 0).all(), "masked key got dbias"
+
+
+@requires_gpu
+@IMPLEMENTATION_PARAM
 def test_no_bias(impl):
     """Omitting the bias matches an explicit zero bias."""
     B, N_seq, N_res, H, D = 1, 2, 32, 4, 32
@@ -235,69 +289,63 @@ def test_no_bias(impl):
 @requires_gpu
 @IMPLEMENTATION_PARAM
 @DTYPES_PARAM
-def test_fully_masked_row_small_logits(request, impl, dtype):
-    """With every key masked the output is the mean of ``v``.
+@pytest.mark.parametrize("logits", ["small", "large"])
+@pytest.mark.parametrize("use_exp2", [False, True], ids=["exp", "exp2"])
+def test_fully_masked_row_is_uniform(impl, dtype, logits, use_exp2):
+    """With every key masked the softmax is uniform, as in AlphaFold3: the
+    output is the mean of ``v``, every key gets ``dv = sum_i dO[i] / N_res``,
+    and ``q``, ``k`` and the bias get no gradient.
 
-    ``mask_val`` is large enough that adding it rounds logits away entirely, so
-    every logit in the row lands on the same value and ``exp(logit - max)`` is
-    exactly 1 for all of them. Softmax is then uniform. ``v`` holds small
-    integers over a power-of-two ``N_res`` so the mean is exactly representable.
+    Masked logits are replaced, not offset, so every logit in the row is the
+    same constant however large ``q . k`` and the bias were. ``"large"`` puts
+    them around ``1e4``, which an additive ``-1e9`` (fp32 ulp 64) would have
+    left distinct. ``v`` and ``dO`` hold small integers over a power-of-two
+    ``N_res`` so the means are exactly representable.
 
-    ``-mask_val`` rounds logits away entirely when they're < ULP/2, so every
-    logit in the row lands on the same value, ``exp(logit - max)`` is 1 for all
-    of them, and softmax is uniform. ``v`` holds small integers over a
-    power-of-two ``N_res`` so the mean is exactly representable.
-
-    At inf=1e9 for fp32 and bf16 1 ULP is 64, so this requires logits under 32.
-    fp16 xfails because its ulp puts the bound at 0.001, so its logits stay
-    distinct.
-
-    Softmax over no keys is undefined, so this pins what the finite sentinel
-    happens to produce, not a mathematical truth.
+    Softmax over no keys is undefined; uniform is the convention, not a
+    mathematical truth.
     """
-    if impl is triangle_attention_triton and dtype is torch.float16:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="fp16 ulp puts the collapse bound at 0.001",
-            )
-        )
+    if use_exp2:
+        if impl is triangle_attention_torch:
+            pytest.skip("the reference has no base-2 path")
+        impl = functools.partial(impl, use_exp2=True)
     B, N_seq, N_res, H, D = 1, 1, 32, 4, 16
-    values = torch.randint(
-        -4, 5, (B, N_seq, N_res, H, D), device="cuda", generator=generator("cuda", 5)
+    shape = (B, N_seq, N_res, H, D)
+    values = torch.randint(-4, 5, shape, device="cuda", generator=generator("cuda", 5))
+    grad_out = torch.randint(
+        -4, 5, shape, device="cuda", generator=generator("cuda", 6)
     )
+    q = torch.randn(shape, device="cuda", generator=generator("cuda", 7))
+    bias = torch.zeros(B, 1, H, N_res, N_res, device="cuda")
+    if logits == "large":
+        q = q * 100
+        bias = 1e4 * torch.randn(
+            bias.shape, device="cuda", generator=generator("cuda", 9)
+        )
     tensors = {
-        "q": torch.randn(
-            B,
-            N_seq,
-            N_res,
-            H,
-            D,
-            device="cuda",
-            dtype=dtype,
-            generator=generator("cuda", 7),
-        ),
-        "k": torch.randn(
-            B,
-            N_seq,
-            N_res,
-            H,
-            D,
-            device="cuda",
-            dtype=dtype,
-            generator=generator("cuda", 8),
+        "q": q.to(dtype),
+        "k": torch.randn(shape, device="cuda", generator=generator("cuda", 8)).to(
+            dtype
         ),
         "v": values.to(dtype),
-        "bias": torch.zeros(B, 1, H, N_res, N_res, device="cuda", dtype=dtype),
+        "bias": bias.to(dtype),
     }
+    leaves = {k: t.detach().clone().requires_grad_(True) for k, t in tensors.items()}
     mask = torch.zeros(B, N_seq, 1, 1, N_res, device="cuda", dtype=torch.bool)
 
-    with torch.no_grad():
-        out = impl(**tensors, mask=mask, scale=D**-0.5)
+    out = impl(**leaves, mask=mask, scale=D**-0.5)
+    out.backward(grad_out.to(dtype))
 
     expected = values.double().mean(dim=2, keepdim=True).expand_as(out)
     accumulator_ulp = torch.finfo(torch.float32).eps * expected.abs().max().item()
     torch.testing.assert_close(out.double(), expected, rtol=0, atol=accumulator_ulp)
+    expected_dv = grad_out.double().mean(dim=2, keepdim=True).expand_as(out)
+    accumulator_ulp = torch.finfo(torch.float32).eps * expected_dv.abs().max().item()
+    torch.testing.assert_close(
+        leaves["v"].grad.double(), expected_dv, rtol=0, atol=accumulator_ulp
+    )
+    for name in ("q", "k", "bias"):
+        assert (leaves[name].grad == 0).all(), f"fully masked row gave d{name}"
 
 
 @requires_gpu
@@ -314,28 +362,12 @@ def test_non_boolean_mask_is_rejected(dtype):
 
 
 @DTYPES_PARAM
-def test_mask_val_is_representable(dtype):
-    """The additive mask val must not overflow."""
-    assert torch.tensor(-mask_val(dtype), dtype=dtype).isfinite()
-
-
-@DTYPES_PARAM
-def test_mask_val_suppresses_any_realistic_logit(dtype):
-    """A masked key has to end up far enough below the largest unmasked one
-    that softmax gives it exactly zero.
-
-    The kernel reduces the softmax in fp32 whatever the input dtype, and fp32
-    ``exp`` underflows to exactly zero below -103.97. Worst case is a masked key
-    whose own logit sits at ``+L`` against an unmasked key at ``-L``, so
-    suppression needs ``(L - mask_val) - (-L) < -104``, i.e.
-
-        L < mask_val / 2 - 52
-
-    where ``L`` bounds ``|qk * scale| + |pair bias|`` together. The tightest
-    case is fp16, which still clears 16324 -- orders above anything a real
-    model produces.
-    """
-    assert mask_val(dtype) / 2 - 52 > 1e4
+def test_mask_marker_is_finite(dtype):
+    """The kernels tell masked keys (finite negative ``masked_key_bias``) from
+    padding keys past ``N_res`` (``-inf``), so the marker must not overflow."""
+    marker = masked_key_bias(torch.tensor([True, False]), dtype).to(dtype)
+    assert marker[0] == 0
+    assert marker[1].isfinite() and marker[1] < 0
 
 
 @requires_gpu
@@ -532,21 +564,12 @@ def test_exp2_softmax(shape, dtype):
 
 @requires_gpu
 @DTYPES_PARAM
-def test_fully_masked_row(request, dtype):
-    """Fully masked row, against the reference in fp64.
+def test_fully_masked_row(dtype):
+    """Fully masked row, gradients included, against the reference in fp64.
 
-    The forward for small logits is analytically the mean of ``v`` (see
-    ``test_fully_masked_row_small_logits``) but the gradients are not -- they
-    are an artifact of what the finite sentinel leaves behind, so the reference
-    is the only thing to hold them to.
+    Both replace masked logits with ``finfo.min`` of their logit dtype, so the
+    row is uniform in every dtype (see ``test_fully_masked_row_is_uniform``).
     """
-    if dtype is torch.float16:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="fp16 mask_val too small to swamp the logits",
-            )
-        )
     B, N_seq, N_res, H, D = 1, 1, 64, 4, 32
     tensors = make_inputs(
         B, N_seq, N_res, H, D, "cuda", dtype, seed=3, requires_grad=True

@@ -39,7 +39,11 @@ def triangle_attention(
             for no bias (skips all bias work in the kernel).
         mask: boolean tensor where ``True`` keeps and ``False`` masks; shape
             broadcastable to ``[B, N_seq, 1, 1, N_res]``, or ``None`` for
-            all-keep.
+            all-keep. As in AlphaFold3, a masked key's logit is replaced (after
+            scale and bias) with ``finfo(float32).min``: masked keys get zero
+            weight whenever a row keeps a key whose fp32 logit is above that
+            (above ``-2.36e38`` with ``use_exp2``), a fully masked row returns
+            the mean of ``v``, and masked entries get no gradient.
         scale: softmax scale, passed to the kernel as its ``softmax_scale``
             runtime argument. ``None`` uses the kernel default ``1/sqrt(D)``.
         dynamic: when ``True``, use the variable-shape kernel entry point (one
