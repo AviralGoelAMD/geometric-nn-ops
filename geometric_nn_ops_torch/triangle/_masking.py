@@ -1,13 +1,39 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Turning a key mask into an additive bias on the softmax logits.
+"""Masking keys out of a softmax.
 
-Shared by the ops that mask keys out of a softmax, so they all push a masked
-key down by the same amount and fold a boolean mask the same way.
+Two schemes live here:
+
+- **Additive** (``mask_val``, ``masked_key_bias``): push a masked key's logit
+  down by a large dtype-dependent amount. Used by attention with pair bias.
+- **Replacement** (``MASKED_LOGIT``, ``replace_masked_logits``): set a masked
+  key's final logit to ``finfo.min``, as AlphaFold3/tokamax do. Used by
+  triangle attention.
 """
 
 import torch
+
+# Triangle attention replaces a masked key's logit with this constant after
+# scale, pair bias and any base-2 ``* log2e`` scaling, instead of adding
+# ``-mask_val``. Every masked logit in a row is then the same value whatever
+# ``q``, ``k`` or the bias were, so a fully masked row is exactly uniform (output
+# ``mean(v)``) in every dtype and masked entries carry no gradient. It is
+# ``finfo.min`` of the logit dtype, like tokamax: the kernels compute logits in
+# fp32 and replace the final tile, so the constant itself is never scaled.
+# Masked keys lose to any kept logit above ``finfo(fp32).min``; on the base-2
+# path the kept logit must stay above ``finfo(fp32).min / log2(e)`` (~-2.36e38),
+# below which ``* log2e`` overflows it to ``-inf``.
+MASKED_LOGIT = torch.finfo(torch.float32).min
+
+
+def replace_masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Masked logits (``mask == False``) -> ``finfo(logits.dtype).min``.
+
+    The torch counterpart of the kernels' ``MASKED_LOGIT`` replacement, in the
+    logits' own dtype (``finfo(float64).min`` for the fp64 reference).
+    """
+    return torch.where(mask, logits, torch.finfo(logits.dtype).min)
 
 
 def mask_val(dtype: torch.dtype) -> float:
@@ -33,7 +59,11 @@ def mask_val(dtype: torch.dtype) -> float:
 
 
 def masked_key_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Boolean mask -> additive bias, ``0`` where kept and ``-mask_val`` where not."""
+    """Boolean mask -> additive bias, ``0`` where kept and ``-mask_val`` where not.
+
+    The triangle attention kernels read it only as a marker (``0`` kept, finite
+    negative masked) and replace masked logits with ``MASKED_LOGIT``.
+    """
     # Note that we deliberately spell this the same way openfold-3 has
     # historically, so that for now we can get bitwise identical results. A
     # masked fill or `(~mask) * -mask_val` would be more natural, but would yield

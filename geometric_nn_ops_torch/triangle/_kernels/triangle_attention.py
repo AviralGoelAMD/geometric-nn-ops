@@ -20,6 +20,7 @@ import torch
 
 from geometric_nn_ops_torch import _precision
 from geometric_nn_ops_torch.triangle._masking import (
+    MASKED_LOGIT,
     masked_key_bias,
 )
 
@@ -44,6 +45,30 @@ if _TRITON_AVAILABLE:
     def is_hip():
         """Check if the current backend is HIP."""
         return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+    # A jit function can only read a module global if it is a constexpr.
+    _MASKED_LOGIT = tl.constexpr(MASKED_LOGIT)
+
+    @triton.jit
+    def _mask_logits(logits, res_mask):
+        """Replace masked logits with ``MASKED_LOGIT`` (AlphaFold3 style).
+
+        ``res_mask`` holds ``masked_key_bias``: ``0`` keeps the logit and a finite
+        negative value masks the key. ``-inf`` is what the kernels load for
+        padding keys past ``SEQ_LEN``; it stays ``-inf`` so padding never takes
+        softmax weight, not even in a fully masked row.
+
+        Apply it to the final logit tile, after the bias, padding and base-2
+        scaling, so the constant is never scaled (``finfo.min * log2e`` would
+        overflow to ``-inf``) and every masked logit is exactly the constant
+        (an fma-contracted ``x * log2e - max`` would otherwise leave a rounding
+        residual that skews a fully masked row).
+        """
+        return tl.where(
+            res_mask == 0,
+            logits,
+            tl.where(res_mask == float("-inf"), float("-inf"), _MASKED_LOGIT),
+        )
 
     @triton.jit
     def _attn_fwd_inner(
@@ -136,6 +161,9 @@ if _TRITON_AVAILABLE:
                         other=0.0,
                     )
 
+            # Kept logits get `+ res_mask` (+0.0) exactly as before so their
+            # arithmetic, and so OpenFold3 parity, is unchanged; masked logits are
+            # replaced below.
             QK_block = (
                 tl.dot(Q_block, K_block, input_precision=MATMUL_PRECISION)
                 + res_mask_block
@@ -155,6 +183,7 @@ if _TRITON_AVAILABLE:
             log2e = 1.4426950408889634  # log2(e): exp(x) == exp2(x * log2e)
             if USE_EXP2:
                 QK_block = QK_block * log2e
+            QK_block = _mask_logits(QK_block, res_mask_block)
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block = QK_block - m_ij[:, None]
 
@@ -736,6 +765,8 @@ if _TRITON_AVAILABLE:
             ].broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
 
             Q_scaled = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
+            # Masked cells (and padding keys) get dS = 0 below, so their logits
+            # never matter here; kept logits keep the old arithmetic bit for bit.
             QK_block = (
                 tl.dot(Q_scaled, K_T_block, input_precision=MATMUL_PRECISION)
                 + res_mask_block
@@ -751,24 +782,15 @@ if _TRITON_AVAILABLE:
             # `QK - M <= 0`.
             P_arg = tl.minimum(QK_block - M_block, 0.0)
             P_block = tl.math.exp2(P_arg) if USE_EXP2 else tl.math.exp(P_arg)
-            # In a fully masked row every logit is -MASK, so the row max m is
-            # -MASK. log(l) is then below the fp32 accumulator ULP at this
-            # magnitude and the forward's `m += log(l)` correction is absorbed
-            # by rounding, so M holds the bare max, leaving exp(QK - M) short by
-            # l. in these cases, l == SEQ_LEN because for that row (QK - M) is
-            # all 0 -> P is all 1 and alpha is 1. So we correct after the exp by
-            # dividing by SEQ_LEN. Without this, the gradients blow up. The
-            # threshold only identifies masked cells; it says nothing about
-            # whether log(l) was absorbed, so it fires for fp16 too, whose
-            # smaller mask_val keeps log(l) and where correcting is wrong -- see
-            # the fp16 xfail on test_fully_masked_row.
-            # TODO(gmnngeoffrey): rework how we do masking and avoid the need
-            # for this workaround
-            P_block = tl.where(res_mask_block <= -1e3, P_block / SEQ_LEN, P_block)
             dP_block = tl.dot(dO_block, V_T_block, input_precision=MATMUL_PRECISION).to(
                 tl.float32
             )
-            dS_block = P_block * (dP_block - Di[:, None])
+            # A replaced logit is a constant, so masked cells pass no gradient to
+            # q, k or the bias; P on them is irrelevant here (dK/dV still needs
+            # the fully-masked-row P for dV).
+            dS_block = tl.where(
+                res_mask_block != 0, 0.0, P_block * (dP_block - Di[:, None])
+            )
 
             if HAS_PAIR_BIAS:
                 dbias_block += dS_block
@@ -1030,12 +1052,21 @@ if _TRITON_AVAILABLE:
             if USE_EXP2:  # opt-in exp2 (match fwd); both fp32 and bf16
                 log2e = 1.4426950408889634  # log2(e): exp(x) == exp2(x * log2e)
                 QK_T_block = QK_T_block * log2e
-            # Fully-masked rows: clamp + renormalize; threshold -1e3 decoupled from the
+            QK_T_block = _mask_logits(QK_T_block, res_mask_T_block)
             P_T_arg = tl.minimum(QK_T_block - m[None, :], 0.0)
             P_T_block = tl.math.exp2(P_T_arg) if USE_EXP2 else tl.math.exp(P_T_arg)
-            P_T_block = tl.where(
-                res_mask_T_block <= -1e3, P_T_block / SEQ_LEN, P_T_block
-            )
+            # Only dV needs P on masked cells, and only for fully masked rows,
+            # whose softmax is uniform (P = 1/l on every key). There every logit
+            # is the same MASKED_LOGIT, so the row max is MASKED_LOGIT and the
+            # forward's `M = m + log(l)` loses log(l) to rounding (fp32's ULP at
+            # finfo.min is ~2e31): exp(QK - M) comes out exactly 1, not 1/l. l is
+            # exactly SEQ_LEN there (padding keys are -inf, never masked), so
+            # dividing masked cells by SEQ_LEN restores the exact 1/l in every
+            # dtype, giving dV = sum_j dO[j] / SEQ_LEN. In a row with any kept
+            # key masked cells already have P == 0 and the division is a no-op.
+            # Storing m and l separately would remove the need for this.
+            is_masked_T = res_mask_T_block != 0
+            P_T_block = tl.where(is_masked_T, P_T_block / SEQ_LEN, P_T_block)
 
             dV_block += tl.dot(
                 P_T_block.to(K_block.dtype),
@@ -1046,7 +1077,10 @@ if _TRITON_AVAILABLE:
             dpT_block = tl.dot(
                 V_block, tl.trans(dO_block), input_precision=MATMUL_PRECISION
             ).to(tl.float32)
-            dS_T_block = P_T_block * (dpT_block - Di[None, :])
+            # A replaced logit is a constant: masked cells pass no gradient to k.
+            dS_T_block = tl.where(
+                is_masked_T, 0.0, P_T_block * (dpT_block - Di[None, :])
+            )
             dS_T_block = dS_T_block.to(K_block.dtype)
 
             dK_block += softmax_scale * tl.dot(

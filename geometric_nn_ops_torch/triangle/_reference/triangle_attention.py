@@ -5,7 +5,7 @@
 
 import torch
 
-from geometric_nn_ops_torch.triangle._masking import masked_key_bias
+from geometric_nn_ops_torch.triangle._masking import replace_masked_logits
 
 
 def triangle_attention_torch(q, k, v, bias=None, mask=None, scale=None):
@@ -16,7 +16,9 @@ def triangle_attention_torch(q, k, v, bias=None, mask=None, scale=None):
         bias: broadcastable to ``[B, 1, H, N_res, N_res]``; a ``[B, H, N, N]``
             bias is unsqueezed to add the ``N_seq`` axis. ``None`` for no bias.
         mask: boolean, broadcastable to ``[B, N_seq, 1, 1, N_res]``; ``True``
-            keeps. ``None`` means all-keep.
+            keeps. ``None`` means all-keep. Masked logits are replaced with
+            ``finfo(acc).min`` after scale and bias (AlphaFold3 style), so a
+            fully masked row is uniform.
         scale: softmax scale; ``None`` -> ``D ** -0.5``.
 
     Returns:
@@ -37,7 +39,7 @@ def triangle_attention_torch(q, k, v, bias=None, mask=None, scale=None):
             bias = bias.unsqueeze(-4)  # [B, H, N, N] -> [B, 1, H, N, N]
         logits = logits + bias.to(acc)
     if mask is not None:
-        logits = logits + masked_key_bias(mask, acc).to(acc)
+        logits = replace_masked_logits(logits, mask)
 
     probs = torch.softmax(logits, dim=-1)
     o = torch.einsum("bshij,bshjd->bshid", probs, vs)
